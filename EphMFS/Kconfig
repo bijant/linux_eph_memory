@@ -1,0 +1,3 @@
+config EPHMFS
+	tristate "Adds EphMFS"
+	default m
