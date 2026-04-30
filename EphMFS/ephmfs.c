@@ -1,4 +1,5 @@
 #include <linux/kernel.h>
+#include <linux/blkdev.h>
 #include <linux/dax.h>
 #include <linux/falloc.h>
 #include <linux/fs.h>
@@ -319,6 +320,55 @@ static void ephmfs_kill_sb(struct super_block *sb)
 	kill_anon_super(sb);
 }
 
+// Populates dev_info with the information from the dax device represented by bdev_file.
+// Should be called with sbi->lock held.
+static int ephmfs_populate_dev_info(struct ephmfs_sb_info *sbi, struct ephmfs_dev_info *dev_info, struct file *bdev_file)
+{
+	int ret = 0;
+	long num_base_pages;
+	u64 start_off;
+	int dax_lock_id;
+
+	pr_err("EphMFS: Populating device info for block device %s\n", bdev_file->f_path.dentry->d_name.name);
+	dev_info->bdev_file = bdev_file;
+	dev_info->dax_dev = fs_dax_get_by_bdev(file_bdev(bdev_file), &start_off, NULL, NULL);
+	if (!dev_info->dax_dev) {
+		pr_err("EphMFS: Failed to get dax device for block device %s\n", bdev_file->f_path.dentry->d_name.name);
+		return -ENODEV;
+	}
+
+	// Determine how many pages are in the device
+	dax_lock_id = dax_read_lock();
+	num_base_pages = dax_direct_access(dev_info->dax_dev, 0, LONG_MAX / PAGE_SIZE,
+		DAX_ACCESS, &dev_info->kaddr, &dev_info->pfn);
+	dax_read_unlock(dax_lock_id);
+	if (num_base_pages <= 0) {
+		pr_err("EphMFS: Failed to access dax device for block device %s\n", bdev_file->f_path.dentry->d_name.name);
+		return -ENODEV;
+	}
+
+	// TODO: this will need to be updated when we start supporting more
+	// than just base pages.
+	dev_info->num_pages = num_base_pages;
+	dev_info->free_pages = num_base_pages;
+
+	INIT_LIST_HEAD(&dev_info->free_list);
+	INIT_LIST_HEAD(&dev_info->active_list);
+	spin_lock_init(&dev_info->lock);
+
+	// TODO: Fill dev_info->free_list.
+	return ret;
+}
+
+static void ephmfs_mark_dead(struct block_device *bdev, bool surprise)
+{
+	pr_err("EphMFS: DAX device %s marked dead (surprise=%d)\n", bdev->bd_disk->disk_name, surprise);
+}
+
+static const struct blk_holder_ops ephmfs_blk_holder_ops = {
+	.mark_dead = ephmfs_mark_dead,
+};
+
 static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
 	struct ephmfs_sb_info *sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
@@ -336,7 +386,64 @@ static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *att
 
 static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
 {
-	return -EOPNOTSUPP;
+	char *dev_name;
+	struct ephmfs_sb_info *sbi;
+	struct ephmfs_dev_info *dev_info;
+	struct file *bdev_file;
+	int err;
+
+	dev_name = kmalloc(count + 1, GFP_KERNEL);
+	if (!dev_name)
+		return -ENOMEM;
+	strncpy(dev_name, buf, count);
+	if (dev_name[count - 1] == '\n')
+		dev_name[count - 1] = '\0';
+	pr_err("EphMFS: Adding device %s\n", dev_name);
+
+	sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
+
+	spin_lock(&sbi->lock);
+	// Make sure the device hasn't already been added
+	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		if (strcmp(dev_info->dev_name, dev_name) == 0) {
+			err = -EEXIST;
+			goto unlock;
+		}
+	}
+
+	bdev_file = bdev_file_open_by_path(dev_name,
+		BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL, sbi,
+		&ephmfs_blk_holder_ops);
+	if (IS_ERR(bdev_file)) {
+		err = PTR_ERR(bdev_file);
+		pr_err("EphMFS: Failed to open block device file for %s (err=%d)\n", dev_name, err);
+		goto unlock;
+	}
+
+	dev_info = kzalloc(sizeof(struct ephmfs_dev_info), GFP_KERNEL);
+	if (!dev_info) {
+		err = -ENOMEM;
+		goto free_bdev_file;
+	}
+	dev_info->dev_name = dev_name;
+	err = ephmfs_populate_dev_info(sbi, dev_info, bdev_file);
+	if (err) {
+		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
+		goto free_dev_info;
+	}
+
+	spin_unlock(&sbi->lock);
+
+	return count;
+
+free_dev_info:
+	kfree(dev_info);
+free_bdev_file:
+	fput(bdev_file);
+unlock:
+	spin_unlock(&sbi->lock);
+	kfree(dev_name);
+	return err;
 }
 
 static struct kobj_attribute ephmfs_devs_attr =
