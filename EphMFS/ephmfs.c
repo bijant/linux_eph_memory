@@ -1,4 +1,5 @@
 #include <linux/kernel.h>
+#include <linux/dax.h>
 #include <linux/falloc.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
@@ -13,22 +14,11 @@
 #include <linux/statfs.h>
 #include <linux/types.h>
 
+#include "ephmfs.h"
+
 static const struct super_operations ephmfs_ops;
 static const struct inode_operations ephmfs_dir_inode_ops;
-
-struct ephmfs_sb_info {
-	u64 num_pages;
-	u64 page_size;
-	struct kobject sysfs_kobj;
-	spinlock_t lock;
-};
-
-struct ephmfs_inode_info {
-	atomic_t alloc_count;
-	spinlock_t mt_lock;
-	struct address_space *mapping;
-	struct maple_tree mt;
-};
+static struct kobj_attribute ephmfs_devs_attr;
 
 static struct ephmfs_sb_info *EMFS_SB(struct super_block *sb)
 {
@@ -231,30 +221,59 @@ static int ephmfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	return 0;
 }
 
+static const struct kobj_type ephmfs_kobj_type = {
+	.sysfs_ops = &kobj_sysfs_ops,
+};
+
 static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *root_inode;
-	struct ephmfs_sb_info *sbi = kzalloc(sizeof(struct ephmfs_sb_info), GFP_KERNEL);
+	struct ephmfs_sb_info *sbi;
+	int err;
 
+	sbi = kzalloc(sizeof(struct ephmfs_sb_info), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
+
+	sbi->num_pages = 0;
+	sbi->page_size = PAGE_SIZE;
+	INIT_LIST_HEAD(&sbi->dax_devs);
+	spin_lock_init(&sbi->lock);
+	kobject_init(&sbi->sysfs_kobj, &ephmfs_kobj_type);
+	err = kobject_add(&sbi->sysfs_kobj, fs_kobj, "ephmfs");
+	if (err) {
+		pr_err("EphMFS: Failed to add sysfs kobject\n");
+		goto err_out;
+	}
+	err = sysfs_create_file(&sbi->sysfs_kobj, &ephmfs_devs_attr.attr);
+	if (err) {
+		pr_err("EphMFS: Failed to create sysfs devs attribute\n");
+		goto kobj_put;
+	}
 
 	sb->s_fs_info = sbi;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_magic = 0xE1E2E3E4;
 	sb->s_op = &ephmfs_ops;
 	sb->s_time_gran = 1;
-	if (!sb_set_blocksize(sb, PAGE_SIZE)) {
-		pr_err("EphMFS: Failed to set block size\n");
-		return -EINVAL;
-	}
+	sb->s_blocksize = PAGE_SIZE;
+	sb->s_blocksize_bits = PAGE_SHIFT;
 
 	root_inode = ephmfs_get_inode(sb, NULL, S_IFDIR | 0755, 0);
 	sb->s_root = d_make_root(root_inode);
-	if (!sb->s_root)
-		return -ENOMEM;
+	if (!sb->s_root) {
+		pr_err("EphMFS: Failed to add make root inode\n");
+		err = -ENOMEM;
+		goto kobj_put;
+	}
 
 	return 0;
+kobj_put:
+	kobject_put(&sbi->sysfs_kobj);
+err_out:
+	kfree(sbi);
+
+	return err;
 }
 
 static int ephmfs_get_tree(struct fs_context *fc)
@@ -280,10 +299,48 @@ static int ephmfs_init_fs_context(struct fs_context *fc)
 
 static void ephmfs_kill_sb(struct super_block *sb)
 {
+	struct ephmfs_dev_info *dev_info, *tmp;
 	struct ephmfs_sb_info *sbi = EMFS_SB(sb);
+
+	sysfs_remove_file(&sbi->sysfs_kobj, &ephmfs_devs_attr.attr);
+	kobject_put(&sbi->sysfs_kobj);
+
+	/* Free all dax device info structures */
+	spin_lock(&sbi->lock);
+	list_for_each_entry_safe(dev_info, tmp, &sbi->dax_devs, node) {
+		list_del(&dev_info->node);
+		fs_put_dax(dev_info->dax_dev, NULL);
+		fput(dev_info->bdev_file);
+		kfree(dev_info->dev_name);
+		kfree(dev_info);
+	}
+	spin_unlock(&sbi->lock);
 	kfree(sbi);
 	kill_anon_super(sb);
 }
+
+static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct ephmfs_sb_info *sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
+	ssize_t len = 0;
+
+	spin_lock(&sbi->lock);
+	struct ephmfs_dev_info *dev_info;
+	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s\n", dev_info->dev_name);
+	}
+	spin_unlock(&sbi->lock);
+
+	return len;
+}
+
+static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	return -EOPNOTSUPP;
+}
+
+static struct kobj_attribute ephmfs_devs_attr =
+__ATTR(devs, 0644, ephmfs_devs_show, ephmfs_devs_store);
 
 static struct file_system_type ephmfs_type = {
 	.owner = THIS_MODULE,
