@@ -9,6 +9,7 @@
 #include <linux/maple_tree.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/namei.h>
 #include <linux/pagemap.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
@@ -310,8 +311,7 @@ static void ephmfs_kill_sb(struct super_block *sb)
 	spin_lock(&sbi->lock);
 	list_for_each_entry_safe(dev_info, tmp, &sbi->dax_devs, node) {
 		list_del(&dev_info->node);
-		fs_put_dax(dev_info->dax_dev, NULL);
-		fput(dev_info->bdev_file);
+		fs_put_dax(dev_info->dax_dev, dev_info);
 		kfree(dev_info->dev_name);
 		kfree(dev_info);
 	}
@@ -322,18 +322,16 @@ static void ephmfs_kill_sb(struct super_block *sb)
 
 // Populates dev_info with the information from the dax device represented by bdev_file.
 // Should be called with sbi->lock held.
-static int ephmfs_populate_dev_info(struct ephmfs_sb_info *sbi, struct ephmfs_dev_info *dev_info, struct file *bdev_file)
+static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax_device *dax_dev)
 {
 	int ret = 0;
 	long num_base_pages;
-	u64 start_off;
 	int dax_lock_id;
 
-	pr_err("EphMFS: Populating device info for block device %s\n", bdev_file->f_path.dentry->d_name.name);
-	dev_info->bdev_file = bdev_file;
-	dev_info->dax_dev = fs_dax_get_by_bdev(file_bdev(bdev_file), &start_off, NULL, NULL);
+	pr_err("EphMFS: Populating device info for dax device %s\n", dev_info->dev_name);
+	dev_info->dax_dev = dax_dev;
 	if (!dev_info->dax_dev) {
-		pr_err("EphMFS: Failed to get dax device for block device %s\n", bdev_file->f_path.dentry->d_name.name);
+		pr_err("EphMFS: Failed to get dax device for block device\n");
 		return -ENODEV;
 	}
 
@@ -343,7 +341,7 @@ static int ephmfs_populate_dev_info(struct ephmfs_sb_info *sbi, struct ephmfs_de
 		DAX_ACCESS, &dev_info->kaddr, &dev_info->pfn);
 	dax_read_unlock(dax_lock_id);
 	if (num_base_pages <= 0) {
-		pr_err("EphMFS: Failed to access dax device for block device %s\n", bdev_file->f_path.dentry->d_name.name);
+		pr_err("EphMFS: Failed to access dax device for block device\n");
 		return -ENODEV;
 	}
 
@@ -360,13 +358,17 @@ static int ephmfs_populate_dev_info(struct ephmfs_sb_info *sbi, struct ephmfs_de
 	return ret;
 }
 
-static void ephmfs_mark_dead(struct block_device *bdev, bool surprise)
+static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, int mf_flags)
 {
-	pr_err("EphMFS: DAX device %s marked dead (surprise=%d)\n", bdev->bd_disk->disk_name, surprise);
+	struct ephmfs_dev_info *dev_info = dax_holder(dax_dev);
+	pr_err("EphMFS: Memory failure detected on device %s at offset %llu for length %llu, (0x%x)\n",
+		dev_info->dev_name, off, len, mf_flags);
+
+	return 0;
 }
 
-static const struct blk_holder_ops ephmfs_blk_holder_ops = {
-	.mark_dead = ephmfs_mark_dead,
+static const struct dax_holder_operations ephmfs_dax_holder_ops = {
+	.notify_failure = ephmfs_notify_failure,
 };
 
 static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
@@ -384,12 +386,76 @@ static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *att
 	return len;
 }
 
+/*
+ * From John Groves
+ * https://lore.kernel.org/linux-fsdevel/86694a1a663ab0b6e8e35c7b187f5ad179103482.1714409084.git.john@groves.net/
+ */
+static int
+lookup_daxdev(char *pathname, dev_t *devno)
+{
+	struct inode *inode;
+	struct path path;
+	int err;
+
+	if (!pathname || !*pathname || !devno)
+		return -EINVAL;
+
+	err = kern_path(pathname, LOOKUP_FOLLOW, &path);
+	if (err)
+		return err;
+
+	inode = d_backing_inode(path.dentry);
+	if (!S_ISCHR(inode->i_mode)) {
+		err = -EINVAL;
+		goto out_path_put;
+	}
+
+	if (!may_open_dev(&path)) {
+		err = -EACCES;
+		goto out_path_put;
+	}
+
+	/* If it's dax, i_rdev is struct dax_device */
+	*devno = inode->i_rdev;
+
+out_path_put:
+	path_put(&path);
+	return err;
+}
+
+static struct dax_device *fs_dax_get_by_path(char *path, void *holder, const struct dax_holder_operations *ops)
+{
+	struct dax_device *dax_dev;
+	dev_t devno;
+	int err;
+
+	err = lookup_daxdev(path, &devno);
+	if (err) {
+		pr_err("EphMFS: Failed to lookup dax device by path %s (err=%d)\n", path, err);
+		return NULL;
+	}
+
+	dax_dev = dax_dev_get(devno);
+	if (!dax_dev) {
+		pr_err("EphMFS: Failed to get dax device for devno %llu\n", (unsigned long long)devno);
+		return NULL;
+	}
+
+	err = fs_dax_get(dax_dev, holder, ops);
+	if (err) {
+		pr_err("EphMFS: Failed to get dax device for devno %llu (err=%d)\n", (unsigned long long)devno, err);
+		return NULL;
+	}
+
+	return dax_dev;
+}
+
 static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
 {
 	char *dev_name;
 	struct ephmfs_sb_info *sbi;
 	struct ephmfs_dev_info *dev_info;
-	struct file *bdev_file;
+	struct dax_device *dax_dev;
 	int err;
 
 	dev_name = kmalloc(count + 1, GFP_KERNEL);
@@ -411,35 +477,36 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 		}
 	}
 
-	bdev_file = bdev_file_open_by_path(dev_name,
-		BLK_OPEN_READ | BLK_OPEN_WRITE | BLK_OPEN_EXCL, sbi,
-		&ephmfs_blk_holder_ops);
-	if (IS_ERR(bdev_file)) {
-		err = PTR_ERR(bdev_file);
-		pr_err("EphMFS: Failed to open block device file for %s (err=%d)\n", dev_name, err);
-		goto unlock;
-	}
-
 	dev_info = kzalloc(sizeof(struct ephmfs_dev_info), GFP_KERNEL);
 	if (!dev_info) {
 		err = -ENOMEM;
-		goto free_bdev_file;
+		goto unlock;
 	}
 	dev_info->dev_name = dev_name;
-	err = ephmfs_populate_dev_info(sbi, dev_info, bdev_file);
-	if (err) {
-		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
+
+	dax_dev = fs_dax_get_by_path(dev_name, dev_info, &ephmfs_dax_holder_ops);
+	if (!dax_dev) {
+		pr_err("EphMFS: Failed to open dax device for %s\n", dev_name);
+		err = -ENODEV;
 		goto free_dev_info;
 	}
+
+	err = ephmfs_populate_dev_info(dev_info, dax_dev);
+	if (err) {
+		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
+		goto put_dax_dev;
+	}
+
+	list_add(&dev_info->node, &sbi->dax_devs);
 
 	spin_unlock(&sbi->lock);
 
 	return count;
 
+put_dax_dev:
+	fs_put_dax(dax_dev, dev_info);
 free_dev_info:
 	kfree(dev_info);
-free_bdev_file:
-	fput(bdev_file);
 unlock:
 	spin_unlock(&sbi->lock);
 	kfree(dev_name);
