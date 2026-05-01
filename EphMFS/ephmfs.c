@@ -443,19 +443,19 @@ static struct dax_device *fs_dax_get_by_path(char *path, void *holder, const str
 	err = lookup_daxdev(path, &devno);
 	if (err) {
 		pr_err("EphMFS: Failed to lookup dax device by path %s (err=%d)\n", path, err);
-		return NULL;
+		return ERR_PTR(err);
 	}
 
 	dax_dev = dax_dev_get(devno);
 	if (!dax_dev) {
 		pr_err("EphMFS: Failed to get dax device for devno %llu\n", (unsigned long long)devno);
-		return NULL;
+		return ERR_PTR(-ENODEV);
 	}
 
 	err = fs_dax_get(dax_dev, holder, ops);
 	if (err) {
 		pr_err("EphMFS: Failed to get dax device for devno %llu (err=%d)\n", (unsigned long long)devno, err);
-		return NULL;
+		return ERR_PTR(err);
 	}
 
 	return dax_dev;
@@ -496,9 +496,9 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 	dev_info->dev_name = dev_name;
 
 	dax_dev = fs_dax_get_by_path(dev_name, dev_info, &ephmfs_dax_holder_ops);
-	if (!dax_dev) {
+	if (IS_ERR(dax_dev)) {
 		pr_err("EphMFS: Failed to open dax device for %s\n", dev_name);
-		err = -ENODEV;
+		err = PTR_ERR(dax_dev);
 		goto free_dev_info;
 	}
 
