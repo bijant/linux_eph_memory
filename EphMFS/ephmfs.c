@@ -188,14 +188,25 @@ static const struct inode_operations ephmfs_dir_inode_ops = {
 static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct super_block *sb = dentry->d_sb;
+	struct ephmfs_sb_info *sbi = EMFS_SB(sb);
+	struct ephmfs_dev_info *dev_info;
+	u64 free_pages = 0;
+
+	spin_lock(&sbi->lock);
+
+	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		free_pages += dev_info->free_pages;
+	}
 
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = PAGE_SIZE;
-	buf->f_blocks = 0;
-	buf->f_bfree = 0;
+	buf->f_blocks = sbi->num_pages;
+	buf->f_bfree = free_pages;
 	buf->f_files = LONG_MAX;
 	buf->f_ffree = LONG_MAX;
 	buf->f_namelen = NAME_MAX;
+
+	spin_unlock(&sbi->lock);
 
 	return 0;
 }
