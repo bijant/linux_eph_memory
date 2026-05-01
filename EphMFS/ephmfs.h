@@ -8,7 +8,6 @@
 
 /* Stores the information for a dax device used by EphMFS */
 struct ephmfs_dev_info {
-	struct file *bdev_file;
 	struct dax_device *dax_dev;
 	char *dev_name; /* The name of the device, e.g. "dax0.0" */
 	void *kaddr; /* Kernel virtual address for the mapped device */
