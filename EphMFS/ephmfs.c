@@ -507,6 +507,7 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
 		goto put_dax_dev;
 	}
+	sbi->num_pages += dev_info->num_pages;
 
 	list_add(&dev_info->node, &sbi->dax_devs);
 
