@@ -20,16 +20,35 @@ struct ephmfs_dev_info {
 	struct list_head node;
 };
 
+struct ephmfs_page {
+	u64 page_num; /* The physical page number within the device */
+	u64 page_offset; /* The page offset within the file */
+	/*
+	 * If we are using huge pages, but an allocation only uses base pages,
+	 * this represents the number of base pages in this page.
+	 */
+	u64 num_base_pages;
+	struct inode *inode; /* The inode this page belongs to */
+	struct ephmfs_dev_info *dev_info; /* The device this page belongs to */
+	spinlock_t lock; /* Protects the fields above it in this struct. */
+	/*
+	 * Linked list node to connect pages to the free/active list.
+	 * Protected by ephmfs_dev_info.lock
+	 */
+	struct list_head node;
+};
+
 struct ephmfs_sb_info {
-	u64 num_pages;
 	u64 page_size;
 	struct kobject sysfs_kobj;
 	struct list_head dax_devs;
+	/* TODO: This would probably be better as a read/write lock */
 	spinlock_t lock;
 };
 
 struct ephmfs_inode_info {
 	atomic_t alloc_count;
+	/* TODO: This would probably be better as a read/write lock */
 	spinlock_t mt_lock;
 	struct address_space *mapping;
 	struct maple_tree mt;
