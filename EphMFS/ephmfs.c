@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#include <linux/iomap.h>
 #include <linux/kobject.h>
 #include <linux/maple_tree.h>
 #include <linux/mm.h>
@@ -32,9 +33,123 @@ static struct ephmfs_inode_info *EMFS_INODE(struct inode *inode)
 	return inode->i_private;
 }
 
+static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
+{
+	struct ephmfs_page *page = NULL;
+	struct ephmfs_dev_info *dev_info;
+	void *kaddr;
+
+	spin_lock(&sbi->lock);
+
+	/* Find a device with free pages */
+	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		spin_lock(&dev_info->lock);
+
+		if (dev_info->free_pages == 0) {
+			spin_unlock(&dev_info->lock);
+			continue;
+		}
+
+		page = list_first_entry(&dev_info->free_list, struct ephmfs_page, node);
+		list_del(&page->node);
+		list_add_tail(&page->node, &dev_info->active_list);
+		dev_info->free_pages--;
+
+		spin_unlock(&dev_info->lock);
+
+		break;
+	}
+
+	/* Make sure to zero the page */
+	if (page) {
+		kaddr = dev_info->kaddr + (page->page_num << ilog2(sbi->page_size));
+		memset(kaddr, 0, sbi->page_size);
+	}
+
+	spin_unlock(&sbi->lock);
+
+	return page;
+}
+
+static void ephmfs_free_page(struct ephmfs_page *page)
+{
+	struct ephmfs_dev_info *dev_info = page->dev_info;
+
+	spin_lock(&dev_info->lock);
+
+	list_del(&page->node);
+	list_add(&page->node, &dev_info->free_list);
+	dev_info->free_pages++;
+
+	spin_lock(&page->lock);
+	page->page_offset = 0;
+	page->inode = NULL;
+	spin_unlock(&page->lock);
+
+	spin_unlock(&dev_info->lock);
+}
+
+static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
+{
+	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
+	struct ephmfs_inode_info *inode_info = EMFS_INODE(inode);
+	struct ephmfs_page *page;
+	u64 page_offset;
+	u64 page_shift;
+	int ret = 0;
+
+	page_shift = ilog2(sbi->page_size);
+	page_offset = offset >> page_shift;
+
+	iomap->flags = 0;
+	iomap->offset = offset;
+	iomap->length = length;
+
+	spin_lock(&inode_info->mt_lock);
+	page = mtree_load(&inode_info->mt, page_offset);
+
+	if (!page) {
+		page = ephmfs_alloc_page(sbi);
+		if (!page) {
+			ret = -ENOMEM;
+			goto out_unlock;
+		}
+
+		ret = mtree_insert(&inode_info->mt, page_offset, page, GFP_KERNEL);
+		if (ret) {
+			ephmfs_free_page(page);
+			goto out_unlock;
+		}
+
+		iomap->flags |= IOMAP_F_NEW;
+		iomap->type = IOMAP_MAPPED;
+		iomap->addr = page->page_num << page_shift;
+		iomap->dax_dev = page->dev_info->dax_dev;
+	} else {
+		/* There is already a page allocated. Just use that */
+		iomap->type = IOMAP_MAPPED;
+		iomap->addr = page->page_num << page_shift;
+		iomap->dax_dev = page->dev_info->dax_dev;
+	}
+
+out_unlock:
+	spin_unlock(&inode_info->mt_lock);
+	return ret;
+}
+
+const struct iomap_ops ephmfs_iomap_ops = {
+	.iomap_begin = ephmfs_iomap_begin,
+};
+
 static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
-	return VM_FAULT_SIGBUS;
+	vm_fault_t result = 0;
+	unsigned long pfn;
+
+	result = dax_iomap_fault(vmf, order, &pfn, NULL, &ephmfs_iomap_ops);
+
+	return result;
 }
 
 static vm_fault_t ephmfs_fault(struct vm_fault *vmf)
@@ -190,17 +305,19 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct super_block *sb = dentry->d_sb;
 	struct ephmfs_sb_info *sbi = EMFS_SB(sb);
 	struct ephmfs_dev_info *dev_info;
+	u64 num_pages = 0;
 	u64 free_pages = 0;
 
 	spin_lock(&sbi->lock);
 
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		num_pages += dev_info->num_pages;
 		free_pages += dev_info->free_pages;
 	}
 
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = PAGE_SIZE;
-	buf->f_blocks = sbi->num_pages;
+	buf->f_blocks = num_pages;
 	buf->f_bfree = free_pages;
 	buf->f_files = LONG_MAX;
 	buf->f_ffree = LONG_MAX;
@@ -248,7 +365,6 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!sbi)
 		return -ENOMEM;
 
-	sbi->num_pages = 0;
 	sbi->page_size = PAGE_SIZE;
 	INIT_LIST_HEAD(&sbi->dax_devs);
 	spin_lock_init(&sbi->lock);
@@ -336,8 +452,10 @@ static void ephmfs_kill_sb(struct super_block *sb)
 static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax_device *dax_dev)
 {
 	int ret = 0;
+	struct ephmfs_page *cursor, *tmp;
 	long num_base_pages;
 	int dax_lock_id;
+	long i;
 
 	pr_err("EphMFS: Populating device info for dax device %s\n", dev_info->dev_name);
 	dev_info->dax_dev = dax_dev;
@@ -365,7 +483,26 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax
 	INIT_LIST_HEAD(&dev_info->active_list);
 	spin_lock_init(&dev_info->lock);
 
-	// TODO: Fill dev_info->free_list.
+	/* Initially place all pages on the free list */
+	for (i = 0; i < dev_info->num_pages; i++) {
+		struct ephmfs_page *page = kzalloc(sizeof(struct ephmfs_page), GFP_KERNEL);
+		if (!page) {
+			ret = -ENOMEM;
+			goto err_out;
+		}
+		page->page_num = i;
+		page->inode = NULL;
+		page->dev_info = dev_info;
+		spin_lock_init(&page->lock);
+		list_add(&page->node, &dev_info->free_list);
+	}
+	return ret;
+
+err_out:
+	list_for_each_entry_safe(cursor, tmp, &dev_info->free_list, node) {
+		list_del(&cursor->node);
+		kfree(cursor);
+	}
 	return ret;
 }
 
@@ -507,7 +644,6 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
 		goto put_dax_dev;
 	}
-	sbi->num_pages += dev_info->num_pages;
 
 	list_add(&dev_info->node, &sbi->dax_devs);
 
