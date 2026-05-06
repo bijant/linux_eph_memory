@@ -319,6 +319,7 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_bsize = PAGE_SIZE;
 	buf->f_blocks = num_pages;
 	buf->f_bfree = free_pages;
+	buf->f_bavail = free_pages;
 	buf->f_files = LONG_MAX;
 	buf->f_ffree = LONG_MAX;
 	buf->f_namelen = NAME_MAX;
