@@ -331,6 +331,17 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 static void ephmfs_free_inode(struct inode *inode)
 {
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct ephmfs_page *page;
+	unsigned long index = 0;
+
+	spin_lock(&info->mt_lock);
+
+	mt_for_each(&info->mt, page, index, ULONG_MAX)
+		ephmfs_free_page(page);
+
+	spin_unlock(&info->mt_lock);
+
+	mtree_destroy(&info->mt);
 	kfree(info);
 }
 
