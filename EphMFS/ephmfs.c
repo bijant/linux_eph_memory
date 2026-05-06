@@ -89,6 +89,31 @@ static void ephmfs_free_page(struct ephmfs_page *page)
 	spin_unlock(&dev_info->lock);
 }
 
+/*
+ * Allocate a page and insert it into the inode's maple tree at the given offset.
+ * Returns the allocated page, or NULL on failure.
+ * The inode_info->mt_lock should be held by the caller, and will still be held
+ * when this function returns.
+ */
+static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *sbi,
+	struct ephmfs_inode_info *inode_info, u64 page_offset)
+{
+	struct ephmfs_page *page;
+	int ret;
+
+	page = ephmfs_alloc_page(sbi);
+	if (!page)
+		return NULL;
+
+	ret = mtree_insert(&inode_info->mt, page_offset, page, GFP_KERNEL);
+	if (ret) {
+		ephmfs_free_page(page);
+		return NULL;
+	}
+
+	return page;
+}
+
 static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
 {
@@ -110,15 +135,9 @@ static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	page = mtree_load(&inode_info->mt, page_offset);
 
 	if (!page) {
-		page = ephmfs_alloc_page(sbi);
+		page = ephmfs_alloc_and_insert_page(sbi, inode_info, page_offset);
 		if (!page) {
-			ret = -ENOMEM;
-			goto out_unlock;
-		}
-
-		ret = mtree_insert(&inode_info->mt, page_offset, page, GFP_KERNEL);
-		if (ret) {
-			ephmfs_free_page(page);
+			ret = -ENOSPC;
 			goto out_unlock;
 		}
 
@@ -188,7 +207,49 @@ static unsigned long ephmfs_get_unmapped_area(struct file *file,
 
 static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
-	return -EOPNOTSUPP;
+	struct inode *inode = file_inode(file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
+	struct ephmfs_page *page;
+	u64 page_shift;
+	u64 off;
+
+	page_shift = ilog2(sbi->page_size);
+
+	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		// Free pages in the desired range
+		for (off = offset; off < offset + len; off += sbi->page_size) {
+			u64 page_offset = off >> page_shift;
+
+			spin_lock(&info->mt_lock);
+			page = mtree_erase(&info->mt, page_offset);
+			spin_unlock(&info->mt_lock);
+
+			if (page)
+				ephmfs_free_page(page);
+		}
+		return 0;
+	} else if (mode != 0) {
+		return -EOPNOTSUPP;
+	}
+
+	// Allocate pages for the desired range
+	for (off = offset; off < offset + len; off += sbi->page_size) {
+		u64 page_offset = off >> page_shift;
+
+		spin_lock(&info->mt_lock);
+		page = mtree_load(&info->mt, page_offset);
+		if (!page) {
+			page = ephmfs_alloc_and_insert_page(sbi, info, page_offset);
+			if (!page) {
+				spin_unlock(&info->mt_lock);
+				return -ENOSPC;
+			}
+		}
+		spin_unlock(&info->mt_lock);
+	}
+
+	return 0;
 }
 
 const struct file_operations ephmfs_file_operations = {
