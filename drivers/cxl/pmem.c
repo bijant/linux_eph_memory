@@ -554,7 +554,12 @@ static __exit void cxl_pmem_exit(void)
 
 MODULE_DESCRIPTION("CXL PMEM: Persistent Memory Support");
 MODULE_LICENSE("GPL v2");
-module_init(cxl_pmem_init);
+/*
+ * Must run before cxl_acpi_init (subsys_initcall_sync) so that
+ * cxl_nvdimm_bridge_driver is registered when cxl_acpi_probe() calls
+ * device_add() with PROBE_FORCE_SYNCHRONOUS for the nvdimm-bridge device.
+ */
+subsys_initcall(cxl_pmem_init);
 module_exit(cxl_pmem_exit);
 MODULE_IMPORT_NS("CXL");
 MODULE_ALIAS_CXL(CXL_DEVICE_NVDIMM_BRIDGE);
