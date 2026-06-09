@@ -105,6 +105,9 @@ static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *s
 	if (!page)
 		return NULL;
 
+	/* Record the file offset before publishing the page into the tree. */
+	page->page_offset = page_offset;
+
 	ret = mtree_insert(&inode_info->mt, page_offset, page, GFP_KERNEL);
 	if (ret) {
 		ephmfs_free_page(page);
