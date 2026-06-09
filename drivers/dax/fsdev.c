@@ -55,6 +55,15 @@ static long __fsdev_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
 	phys_addr_t phys;
 	unsigned long local_pfn;
 
+	/*
+	 * nr_pages is the max number of pages the caller can handle, but
+	 * dax_pgoff_to_phys() will return -1 if the entire range is not valid.
+	 * Therefore, limit size to the device's cached_size which was computed
+	 * at probe time. The size cannot change while the driver is bound
+	 * (resize returns -EBUSY).
+	 */
+	size = min(size, dev_dax->cached_size - offset);
+
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, size);
 	if (phys == -1) {
 		dev_dbg(&dev_dax->dev,
@@ -69,11 +78,7 @@ static long __fsdev_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
 	if (pfn)
 		*pfn = local_pfn;
 
-	/*
-	 * Use cached_size which was computed at probe time. The size cannot
-	 * change while the driver is bound (resize returns -EBUSY).
-	 */
-	return PHYS_PFN(min(size, dev_dax->cached_size - offset));
+	return PHYS_PFN(size);
 }
 
 static int fsdev_dax_zero_page_range(struct dax_device *dax_dev,
