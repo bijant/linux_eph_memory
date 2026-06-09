@@ -164,12 +164,44 @@ const struct iomap_ops ephmfs_iomap_ops = {
 	.iomap_begin = ephmfs_iomap_begin,
 };
 
+/*
+ * Callback invoked by dax_break_layout() while it waits for a mapped DAX page
+ * to become idle. Drop the invalidate lock so the process holding the mapping
+ * can unmap/unpin the page, then reacquire it before retrying.
+ */
+static void ephmfs_wait_dax_page(struct inode *inode)
+{
+	filemap_invalidate_unlock(inode->i_mapping);
+	schedule();
+	filemap_invalidate_lock(inode->i_mapping);
+}
+
+/*
+ * Unmap [start, end) from all processes and remove the corresponding DAX
+ * entries from the mapping, waiting for any outstanding page references to
+ * drain. After this returns successfully the backing pages in the range are no
+ * longer mapped and may be freed. Must be called with the inode's invalidate
+ * lock held exclusively.
+ */
+static int ephmfs_break_layout(struct inode *inode, loff_t start, loff_t end)
+{
+	return dax_break_layout(inode, start, end, ephmfs_wait_dax_page);
+}
+
 static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
+	struct inode *inode = file_inode(vmf->vma->vm_file);
 	vm_fault_t result = 0;
 	unsigned long pfn;
 
+	/*
+	 * Hold the invalidate lock shared across the fault so that hole-punch
+	 * and truncate (which take it exclusively) cannot free a page out from
+	 * under us while we are establishing a mapping for it.
+	 */
+	filemap_invalidate_lock_shared(inode->i_mapping);
 	result = dax_iomap_fault(vmf, order, &pfn, NULL, &ephmfs_iomap_ops);
+	filemap_invalidate_unlock_shared(inode->i_mapping);
 
 	return result;
 }
@@ -220,6 +252,24 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 	page_shift = ilog2(sbi->page_size);
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
+		int ret;
+
+		/*
+		 * Unmap the range and drain any references before freeing the
+		 * backing pages. Otherwise a process that still has the range
+		 * mapped would keep accessing pages that have been returned to
+		 * the device free list (and possibly reallocated to another
+		 * inode). The invalidate lock keeps faults from re-establishing
+		 * a mapping while we tear it down.
+		 */
+		filemap_invalidate_lock(inode->i_mapping);
+
+		ret = ephmfs_break_layout(inode, offset, offset + len);
+		if (ret) {
+			filemap_invalidate_unlock(inode->i_mapping);
+			return ret;
+		}
+
 		// Free pages in the desired range
 		for (off = offset; off < offset + len; off += sbi->page_size) {
 			u64 page_offset = off >> page_shift;
@@ -231,6 +281,8 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 			if (page)
 				ephmfs_free_page(page);
 		}
+
+		filemap_invalidate_unlock(inode->i_mapping);
 		return 0;
 	} else if (mode != 0) {
 		return -EOPNOTSUPP;
@@ -266,9 +318,71 @@ const struct file_operations ephmfs_file_operations = {
 	.fallocate = ephmfs_fallocate,
 };
 
+/*
+ * Free every backing page that lies entirely beyond @newsize. The page that
+ * contains @newsize (if any) is kept. Caller must hold the invalidate lock and
+ * must have already broken the DAX layout for the truncated range.
+ */
+static void ephmfs_truncate_pages(struct inode *inode, loff_t newsize)
+{
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
+	u64 page_shift = ilog2(sbi->page_size);
+	/* First page index fully beyond the new size. */
+	unsigned long index = (newsize + sbi->page_size - 1) >> page_shift;
+	struct ephmfs_page *page;
+
+	spin_lock(&info->mt_lock);
+	mt_for_each(&info->mt, page, index, ULONG_MAX) {
+		mtree_erase(&info->mt, page->page_offset);
+		ephmfs_free_page(page);
+	}
+	spin_unlock(&info->mt_lock);
+}
+
+static int ephmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			  struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	int error;
+
+	error = setattr_prepare(idmap, dentry, attr);
+	if (error)
+		return error;
+
+	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size < inode->i_size) {
+		/*
+		 * Shrinking: unmap and free the backing pages beyond the new
+		 * size. Hold the invalidate lock exclusively so faults cannot
+		 * re-establish a mapping while we tear it down, and break the
+		 * DAX layout before truncating the page cache (otherwise
+		 * truncate_inode_pages would warn about leftover DAX entries)
+		 * and before returning pages to the device.
+		 */
+		filemap_invalidate_lock(inode->i_mapping);
+
+		error = ephmfs_break_layout(inode, attr->ia_size, LLONG_MAX);
+		if (error) {
+			filemap_invalidate_unlock(inode->i_mapping);
+			return error;
+		}
+
+		truncate_setsize(inode, attr->ia_size);
+		ephmfs_truncate_pages(inode, attr->ia_size);
+
+		filemap_invalidate_unlock(inode->i_mapping);
+	} else if (attr->ia_valid & ATTR_SIZE) {
+		truncate_setsize(inode, attr->ia_size);
+	}
+
+	setattr_copy(idmap, inode, attr);
+	mark_inode_dirty(inode);
+	return 0;
+}
+
 const struct inode_operations ephmfs_file_inode_ops = {
 	.getattr = simple_getattr,
-	.setattr = simple_setattr,
+	.setattr = ephmfs_setattr,
 };
 
 const struct address_space_operations ephmfs_aops = {
@@ -393,6 +507,13 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+static void ephmfs_evict_inode(struct inode *inode)
+{
+	dax_break_layout_final(inode);
+	truncate_inode_pages_final(&inode->i_data);
+	clear_inode(inode);
+}
+
 static void ephmfs_free_inode(struct inode *inode)
 {
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
@@ -417,6 +538,7 @@ static int ephmfs_show_options(struct seq_file *m, struct dentry *root)
 
 static const struct super_operations ephmfs_ops = {
 	.statfs = ephmfs_statfs,
+	.evict_inode = ephmfs_evict_inode,
 	.free_inode = ephmfs_free_inode,
 	.drop_inode = inode_just_drop,
 	.show_options = ephmfs_show_options,
