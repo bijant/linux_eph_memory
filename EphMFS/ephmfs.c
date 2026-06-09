@@ -544,7 +544,7 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax
 	dax_read_unlock(dax_lock_id);
 	if (num_base_pages <= 0) {
 		pr_err("EphMFS: Failed to access dax device for block device\n");
-		return -ENODEV;
+		return num_base_pages < 0 ? num_base_pages : -EIO;
 	}
 
 	// TODO: this will need to be updated when we start supporting more
