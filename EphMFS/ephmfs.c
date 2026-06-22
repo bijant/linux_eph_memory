@@ -710,7 +710,7 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 	pr_err("EphMFS: Memory failure detected on device %s at offset %llu for length %llu, (0x%x)\n",
 		dev_info->dev_name, off, len, mf_flags);
 
-	return 0;
+	return -EOPNOTSUPP;
 }
 
 static const struct dax_holder_operations ephmfs_dax_holder_ops = {
