@@ -6,16 +6,20 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 
+struct ephmfs_page;
+
 /* Stores the information for a dax device used by EphMFS */
 struct ephmfs_dev_info {
 	struct dax_device *dax_dev;
 	char *dev_name; /* The name of the device, e.g. "dax0.0" */
 	void *kaddr; /* Kernel virtual address for the mapped device */
 	unsigned long pfn; /* The pfn of the first page of the device */
+	struct ephmfs_page *pages; /* EphMFS pages for this device */
 	struct list_head free_list;
 	struct list_head active_list;
 	u64 num_pages;
 	u64 free_pages;
+	u64 page_size;
 	spinlock_t lock;
 	struct list_head node;
 };
@@ -50,7 +54,7 @@ struct ephmfs_inode_info {
 	atomic_t alloc_count;
 	/* TODO: This would probably be better as a read/write lock */
 	spinlock_t mt_lock;
-	struct address_space *mapping;
+	struct inode *inode;
 	struct maple_tree mt;
 };
 

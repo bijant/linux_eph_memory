@@ -16,6 +16,7 @@
 #include <linux/spinlock.h>
 #include <linux/statfs.h>
 #include <linux/types.h>
+#include <linux/vmalloc.h>
 
 #include "ephmfs.h"
 
@@ -105,8 +106,9 @@ static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *s
 	if (!page)
 		return NULL;
 
-	/* Record the file offset before publishing the page into the tree. */
+	/* Record the file offset and inode before publishing the page into the tree. */
 	page->page_offset = page_offset;
+	page->inode = inode_info->inode;
 
 	ret = mtree_insert(&inode_info->mt, page_offset, page, GFP_KERNEL);
 	if (ret) {
@@ -221,14 +223,12 @@ static struct vm_operations_struct ephmfs_vm_ops = {
 static int ephmfs_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(file);
-	struct ephmfs_inode_info *info = EMFS_INODE(inode);
 
 	/* Only allow mapping of regular files */
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
 
 	vma->vm_ops = &ephmfs_vm_ops;
-	info->mapping = file->f_mapping;
 
 	return 0;
 }
@@ -402,6 +402,7 @@ static struct inode *ephmfs_get_inode(struct super_block *sb, const struct inode
 		iput(inode);
 		return NULL;
 	}
+	info->inode = inode;
 
 	inode->i_ino = get_next_ino();
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
@@ -633,24 +634,23 @@ static void ephmfs_kill_sb(struct super_block *sb)
 	kobject_put(&sbi->sysfs_kobj);
 
 	/* Free all dax device info structures */
-	spin_lock(&sbi->lock);
 	list_for_each_entry_safe(dev_info, tmp, &sbi->dax_devs, node) {
 		list_del(&dev_info->node);
 		fs_put_dax(dev_info->dax_dev, dev_info);
 		kfree(dev_info->dev_name);
+		vfree(dev_info->pages);
 		kfree(dev_info);
 	}
-	spin_unlock(&sbi->lock);
 	kfree(sbi);
 	kill_anon_super(sb);
 }
 
 // Populates dev_info with the information from the dax device represented by bdev_file.
 // Should be called with sbi->lock held.
-static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax_device *dax_dev)
+static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
+	struct dax_device *dax_dev, u64 page_size)
 {
 	int ret = 0;
-	struct ephmfs_page *cursor, *tmp;
 	long num_base_pages;
 	int dax_lock_id;
 	long i;
@@ -676,18 +676,20 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax
 	// than just base pages.
 	dev_info->num_pages = num_base_pages;
 	dev_info->free_pages = num_base_pages;
+	dev_info->page_size = page_size;
 
 	INIT_LIST_HEAD(&dev_info->free_list);
 	INIT_LIST_HEAD(&dev_info->active_list);
 	spin_lock_init(&dev_info->lock);
 
+	dev_info->pages = vcalloc(dev_info->num_pages, sizeof(struct ephmfs_page));
+	if (!dev_info->pages) {
+		pr_err("EphMFS: Failed to allocate ephmfs_page structures for dax device\n");
+		return -ENOMEM;
+	}
 	/* Initially place all pages on the free list */
 	for (i = 0; i < dev_info->num_pages; i++) {
-		struct ephmfs_page *page = kzalloc(sizeof(struct ephmfs_page), GFP_KERNEL);
-		if (!page) {
-			ret = -ENOMEM;
-			goto err_out;
-		}
+		struct ephmfs_page *page = &dev_info->pages[i];
 		page->page_num = i;
 		page->inode = NULL;
 		page->dev_info = dev_info;
@@ -695,22 +697,46 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info, struct dax
 		list_add(&page->node, &dev_info->free_list);
 	}
 	return ret;
-
-err_out:
-	list_for_each_entry_safe(cursor, tmp, &dev_info->free_list, node) {
-		list_del(&cursor->node);
-		kfree(cursor);
-	}
-	return ret;
 }
 
 static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, int mf_flags)
 {
 	struct ephmfs_dev_info *dev_info = dax_holder(dax_dev);
+	u64 page_shift = ilog2(dev_info->page_size);
+	u64 start = off >> page_shift;
+	u64 end = (off + len) >> page_shift;
+	u64 count = 1UL << (page_shift - PAGE_SHIFT);
+	int rc = 0;
+	int ret = 0;
 	pr_err("EphMFS: Memory failure detected on device %s at offset %llu for length %llu, (0x%x)\n",
 		dev_info->dev_name, off, len, mf_flags);
 
-	return -EOPNOTSUPP;
+	end = min(end, dev_info->num_pages);
+
+	for (u64 i = start; i < end; i++) {
+		struct ephmfs_page *page = &dev_info->pages[i];
+		pgoff_t index;
+		struct inode *inode;
+
+		spin_lock(&page->lock);
+		inode = page->inode ? igrab(page->inode) : NULL;
+		// index should be in units of PAGE_SIZE, not the device page size
+		index = page->page_offset << (page_shift - PAGE_SHIFT);
+		spin_unlock(&page->lock);
+
+		if (!inode)
+			continue;
+
+		rc = mf_dax_kill_procs(inode->i_mapping, index, count, mf_flags);
+		iput(inode);
+		if (rc) {
+			ret = rc;
+			pr_err("EphMFS: Failed to kill processes for page %llu on device %s (err=%d)\n",
+				i, dev_info->dev_name, rc);
+		}
+	}
+
+	return ret;
 }
 
 static const struct dax_holder_operations ephmfs_dax_holder_ops = {
@@ -837,7 +863,7 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 		goto free_dev_info;
 	}
 
-	err = ephmfs_populate_dev_info(dev_info, dax_dev);
+	err = ephmfs_populate_dev_info(dev_info, dax_dev, sbi->page_size);
 	if (err) {
 		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
 		goto put_dax_dev;
