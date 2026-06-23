@@ -1728,6 +1728,7 @@ int force_sig_mceerr(int code, void __user *addr, short lsb)
 	info.si_addr_lsb = lsb;
 	return force_sig_info(&info);
 }
+EXPORT_SYMBOL(force_sig_mceerr);
 
 int send_sig_mceerr(int code, void __user *addr, short lsb, struct task_struct *t)
 {

@@ -643,6 +643,7 @@ dax_entry_t dax_lock_mapping_entry(struct address_space *mapping, pgoff_t index,
 	rcu_read_unlock();
 	return (dax_entry_t)entry;
 }
+EXPORT_SYMBOL_GPL(dax_lock_mapping_entry);
 
 void dax_unlock_mapping_entry(struct address_space *mapping, pgoff_t index,
 		dax_entry_t cookie)
@@ -654,6 +655,7 @@ void dax_unlock_mapping_entry(struct address_space *mapping, pgoff_t index,
 
 	dax_unlock_entry(&xas, (void *)cookie);
 }
+EXPORT_SYMBOL_GPL(dax_unlock_mapping_entry);
 
 /*
  * Find page cache entry at given index. If it is a DAX entry, return it

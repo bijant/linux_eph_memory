@@ -93,7 +93,7 @@ static void ephmfs_free_page(struct ephmfs_page *page)
 /*
  * Allocate a page and insert it into the inode's maple tree at the given offset.
  * Returns the allocated page, or NULL on failure.
- * The inode_info->mt_lock should be held by the caller, and will still be held
+ * The inode_info->lock should be held by the caller, and will still be held
  * when this function returns.
  */
 static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *sbi,
@@ -136,7 +136,7 @@ static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	iomap->offset = offset;
 	iomap->length = length;
 
-	spin_lock(&inode_info->mt_lock);
+	spin_lock(&inode_info->lock);
 	page = mtree_load(&inode_info->mt, page_offset);
 
 	if (!page) {
@@ -158,7 +158,7 @@ static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	}
 
 out_unlock:
-	spin_unlock(&inode_info->mt_lock);
+	spin_unlock(&inode_info->lock);
 	return ret;
 }
 
@@ -190,6 +190,36 @@ static int ephmfs_break_layout(struct inode *inode, loff_t start, loff_t end)
 	return dax_break_layout(inode, start, end, ephmfs_wait_dax_page);
 }
 
+static void ephmfs_close(struct vm_area_struct *vma)
+{
+	struct inode *inode = file_inode(vma->vm_file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+
+	spin_lock(&info->lock);
+	if (info->owner == current) {
+		put_task_struct(info->owner);
+		info->owner = NULL;
+		info->base_addr = 0;
+	}
+	spin_unlock(&info->lock);
+}
+
+static int ephmfs_mremap(struct vm_area_struct *vma)
+{
+	struct inode *inode = file_inode(vma->vm_file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+
+	spin_lock(&info->lock);
+	if (info->owner != current) {
+		spin_unlock(&info->lock);
+		return -EPERM;
+	}
+	info->base_addr = vma->vm_start - (vma->vm_pgoff << PAGE_SHIFT);
+	spin_unlock(&info->lock);
+
+	return 0;
+}
+
 static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
@@ -214,6 +244,8 @@ static vm_fault_t ephmfs_fault(struct vm_fault *vmf)
 }
 
 static struct vm_operations_struct ephmfs_vm_ops = {
+	.close = ephmfs_close,
+	.mremap = ephmfs_mremap,
 	.fault = ephmfs_fault,
 	.huge_fault = ephmfs_huge_fault,
 	.page_mkwrite = ephmfs_fault,
@@ -229,10 +261,14 @@ static int ephmfs_mmap(struct file *file, struct vm_area_struct *vma)
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
 
-	if (info->owner && info->owner != current)
+	spin_lock(&info->lock);
+	if (info->owner) {
+		spin_unlock(&info->lock);
 		return -EBUSY;
-	if (!info->owner)
-		info->owner = get_task_struct(current);
+	}
+	info->owner = get_task_struct(current);
+	info->base_addr = vma->vm_start - (vma->vm_pgoff << PAGE_SHIFT);
+	spin_unlock(&info->lock);
 	vma->vm_ops = &ephmfs_vm_ops;
 
 	return 0;
@@ -279,9 +315,9 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 		for (off = offset; off < offset + len; off += sbi->page_size) {
 			u64 page_offset = off >> page_shift;
 
-			spin_lock(&info->mt_lock);
+			spin_lock(&info->lock);
 			page = mtree_erase(&info->mt, page_offset);
-			spin_unlock(&info->mt_lock);
+			spin_unlock(&info->lock);
 
 			if (page)
 				ephmfs_free_page(page);
@@ -297,16 +333,16 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 	for (off = offset; off < offset + len; off += sbi->page_size) {
 		u64 page_offset = off >> page_shift;
 
-		spin_lock(&info->mt_lock);
+		spin_lock(&info->lock);
 		page = mtree_load(&info->mt, page_offset);
 		if (!page) {
 			page = ephmfs_alloc_and_insert_page(sbi, info, page_offset);
 			if (!page) {
-				spin_unlock(&info->mt_lock);
+				spin_unlock(&info->lock);
 				return -ENOSPC;
 			}
 		}
-		spin_unlock(&info->mt_lock);
+		spin_unlock(&info->lock);
 	}
 
 	return 0;
@@ -337,12 +373,12 @@ static void ephmfs_truncate_pages(struct inode *inode, loff_t newsize)
 	unsigned long index = (newsize + sbi->page_size - 1) >> page_shift;
 	struct ephmfs_page *page;
 
-	spin_lock(&info->mt_lock);
+	spin_lock(&info->lock);
 	mt_for_each(&info->mt, page, index, ULONG_MAX) {
 		mtree_erase(&info->mt, page->page_offset);
 		ephmfs_free_page(page);
 	}
-	spin_unlock(&info->mt_lock);
+	spin_unlock(&info->lock);
 }
 
 static int ephmfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
@@ -409,7 +445,7 @@ static struct inode *ephmfs_get_inode(struct super_block *sb, const struct inode
 	}
 	info->inode = inode;
 	info->owner = NULL;
-	spin_lock_init(&info->mt_lock);
+	spin_lock_init(&info->lock);
 	mt_init(&info->mt);
 
 	inode->i_ino = get_next_ino();
@@ -529,12 +565,12 @@ static void ephmfs_free_inode(struct inode *inode)
 	struct ephmfs_page *page;
 	unsigned long index = 0;
 
-	spin_lock(&info->mt_lock);
+	spin_lock(&info->lock);
 
 	mt_for_each(&info->mt, page, index, ULONG_MAX)
 		ephmfs_free_page(page);
 
-	spin_unlock(&info->mt_lock);
+	spin_unlock(&info->lock);
 
 	mtree_destroy(&info->mt);
 	if (info->owner)
@@ -709,6 +745,50 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 	return ret;
 }
 
+static int ephmfs_kill_procs(struct inode *inode, loff_t index, loff_t count, short lsb, int mf_flags)
+{
+	struct page *page = NULL;
+	bool pre_remove = mf_flags & MF_MEM_PRE_REMOVE;
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	struct task_struct *owner;
+	unsigned long addr;
+	dax_entry_t cookie;
+	int ret = 0;
+
+	cookie = dax_lock_mapping_entry(inode->i_mapping, index, &page);
+	if (!cookie) {
+		pr_err("EphMFS: Failed to lock mapping for memory failure\n");
+		return -EBUSY;
+	}
+	if (!page)
+		goto unlock;
+
+	if (!pre_remove)
+		SetPageHWPoison(page);
+
+	spin_lock(&info->lock);
+	owner = info->owner;
+	addr = info->base_addr + (index << PAGE_SHIFT);
+	spin_unlock(&info->lock);
+
+	unmap_mapping_range(inode->i_mapping, index << PAGE_SHIFT, count << PAGE_SHIFT, 0);
+
+	if (!owner)
+		goto unlock;
+
+	if ((mf_flags & MF_ACTION_REQUIRED) && (owner == current))
+		ret = force_sig_mceerr(BUS_MCEERR_AR, (void __user *)addr, lsb);
+	else
+		ret = send_sig_mceerr(BUS_MCEERR_AO, (void __user *)addr, lsb, owner);
+
+	if (ret)
+		pr_err("EphMFS: Failed to kill processes for memory failure (err=%d)\n", ret);
+unlock:
+	dax_unlock_mapping_entry(inode->i_mapping, index, cookie);
+
+	return ret;
+}
+
 static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, int mf_flags)
 {
 	struct ephmfs_dev_info *dev_info = dax_holder(dax_dev);
@@ -718,26 +798,25 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 	u64 count = 1UL << (page_shift - PAGE_SHIFT);
 	int rc = 0;
 	int ret = 0;
-	pr_err("EphMFS: Memory failure detected on device %s at offset %llu for length %llu, (0x%x)\n",
+	pr_err("EphMFS: Memory failure detected on device %s at offset 0x%llx for length 0x%llx, (0x%x)\n",
 		dev_info->dev_name, off, len, mf_flags);
 
 	end = min(end, dev_info->num_pages);
 
 	for (u64 i = start; i < end; i++) {
 		struct ephmfs_page *page = &dev_info->pages[i];
-		pgoff_t index;
+		loff_t index;
 		struct inode *inode;
 
 		spin_lock(&page->lock);
 		inode = page->inode ? igrab(page->inode) : NULL;
-		// index should be in units of PAGE_SIZE, not the device page size
 		index = page->page_offset << (page_shift - PAGE_SHIFT);
 		spin_unlock(&page->lock);
 
 		if (!inode)
 			continue;
 
-		rc = mf_dax_kill_procs(inode->i_mapping, index, count, mf_flags);
+		rc = ephmfs_kill_procs(inode, index, count, page_shift, mf_flags);
 		iput(inode);
 		if (rc) {
 			ret = rc;
