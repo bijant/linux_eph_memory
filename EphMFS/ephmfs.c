@@ -223,11 +223,16 @@ static struct vm_operations_struct ephmfs_vm_ops = {
 static int ephmfs_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
 
 	/* Only allow mapping of regular files */
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
 
+	if (info->owner && info->owner != current)
+		return -EBUSY;
+	if (!info->owner)
+		info->owner = get_task_struct(current);
 	vma->vm_ops = &ephmfs_vm_ops;
 
 	return 0;
@@ -403,6 +408,9 @@ static struct inode *ephmfs_get_inode(struct super_block *sb, const struct inode
 		return NULL;
 	}
 	info->inode = inode;
+	info->owner = NULL;
+	spin_lock_init(&info->mt_lock);
+	mt_init(&info->mt);
 
 	inode->i_ino = get_next_ino();
 	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
@@ -529,6 +537,8 @@ static void ephmfs_free_inode(struct inode *inode)
 	spin_unlock(&info->mt_lock);
 
 	mtree_destroy(&info->mt);
+	if (info->owner)
+		put_task_struct(info->owner);
 	kfree(info);
 }
 

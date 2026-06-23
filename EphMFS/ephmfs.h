@@ -52,6 +52,8 @@ struct ephmfs_sb_info {
 
 struct ephmfs_inode_info {
 	atomic_t alloc_count;
+	/* Assume that only one task can map the same EphMFS file */
+	struct task_struct *owner;
 	/* TODO: This would probably be better as a read/write lock */
 	spinlock_t mt_lock;
 	struct inode *inode;
