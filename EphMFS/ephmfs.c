@@ -658,7 +658,7 @@ static void ephmfs_kill_sb(struct super_block *sb)
 // Populates dev_info with the information from the dax device represented by bdev_file.
 // Should be called with sbi->lock held.
 static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
-	struct dax_device *dax_dev, u64 page_size)
+	struct dax_device *dax_dev, struct ephmfs_sb_info *sbi)
 {
 	int ret = 0;
 	long num_base_pages;
@@ -667,6 +667,7 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 
 	pr_err("EphMFS: Populating device info for dax device %s\n", dev_info->dev_name);
 	dev_info->dax_dev = dax_dev;
+	dev_info->sbi = sbi;
 	if (!dev_info->dax_dev) {
 		pr_err("EphMFS: Failed to get dax device for block device\n");
 		return -ENODEV;
@@ -686,7 +687,6 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 	// than just base pages.
 	dev_info->num_pages = num_base_pages;
 	dev_info->free_pages = num_base_pages;
-	dev_info->page_size = page_size;
 
 	INIT_LIST_HEAD(&dev_info->free_list);
 	INIT_LIST_HEAD(&dev_info->active_list);
@@ -712,7 +712,7 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, int mf_flags)
 {
 	struct ephmfs_dev_info *dev_info = dax_holder(dax_dev);
-	u64 page_shift = ilog2(dev_info->page_size);
+	u64 page_shift = ilog2(dev_info->sbi->page_size);
 	u64 start = off >> page_shift;
 	u64 end = (off + len) >> page_shift;
 	u64 count = 1UL << (page_shift - PAGE_SHIFT);
@@ -873,7 +873,7 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 		goto free_dev_info;
 	}
 
-	err = ephmfs_populate_dev_info(dev_info, dax_dev, sbi->page_size);
+	err = ephmfs_populate_dev_info(dev_info, dax_dev, sbi);
 	if (err) {
 		pr_err("EphMFS: Failed to populate device info for %s (err=%d)\n", dev_name, err);
 		goto put_dax_dev;

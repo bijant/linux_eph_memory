@@ -7,10 +7,12 @@
 #include <linux/types.h>
 
 struct ephmfs_page;
+struct ephmfs_sb_info;
 
 /* Stores the information for a dax device used by EphMFS */
 struct ephmfs_dev_info {
 	struct dax_device *dax_dev;
+	struct ephmfs_sb_info *sbi; /* The superblock this device belongs to */
 	char *dev_name; /* The name of the device, e.g. "dax0.0" */
 	void *kaddr; /* Kernel virtual address for the mapped device */
 	unsigned long pfn; /* The pfn of the first page of the device */
@@ -19,7 +21,6 @@ struct ephmfs_dev_info {
 	struct list_head active_list;
 	u64 num_pages;
 	u64 free_pages;
-	u64 page_size;
 	spinlock_t lock;
 	struct list_head node;
 };
