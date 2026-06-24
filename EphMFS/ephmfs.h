@@ -54,8 +54,7 @@ struct ephmfs_sb_info {
 	u64 page_size;
 	struct kobject sysfs_kobj;
 	struct list_head dax_devs;
-	/* TODO: This would probably be better as a read/write lock */
-	spinlock_t lock;
+	rwlock_t lock;
 };
 
 struct ephmfs_inode_info {

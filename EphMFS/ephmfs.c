@@ -96,7 +96,7 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 	void *kaddr;
 	u64 shift;
 
-	spin_lock(&sbi->lock);
+	read_lock(&sbi->lock);
 	shift = ilog2(sbi->page_size);
 
 	/* Find a device with free pages */
@@ -140,7 +140,7 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 	}
 
 out:
-	spin_unlock(&sbi->lock);
+	read_unlock(&sbi->lock);
 	return ret;
 }
 
@@ -608,7 +608,7 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	u64 free_pages = 0;
 	u64 revoked_pages = 0;
 
-	spin_lock(&sbi->lock);
+	read_lock(&sbi->lock);
 
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
 		spin_lock(&dev_info->lock);
@@ -627,7 +627,7 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_ffree = LONG_MAX;
 	buf->f_namelen = NAME_MAX;
 
-	spin_unlock(&sbi->lock);
+	read_unlock(&sbi->lock);
 
 	return 0;
 }
@@ -692,7 +692,7 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	sbi->page_size = PAGE_SIZE;
 	INIT_LIST_HEAD(&sbi->dax_devs);
-	spin_lock_init(&sbi->lock);
+	rwlock_init(&sbi->lock);
 	kobject_init(&sbi->sysfs_kobj, &ephmfs_kobj_type);
 	err = kobject_add(&sbi->sysfs_kobj, fs_kobj, "ephmfs");
 	if (err) {
@@ -772,7 +772,7 @@ static void ephmfs_kill_sb(struct super_block *sb)
 }
 
 // Populates dev_info with the information from the dax device represented by bdev_file.
-// Should be called with sbi->lock held.
+// Should be called with sbi->lock held with write access.
 static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 	struct dax_device *dax_dev, struct ephmfs_sb_info *sbi)
 {
@@ -922,12 +922,12 @@ static ssize_t ephmfs_devs_show(struct kobject *kobj, struct kobj_attribute *att
 	struct ephmfs_sb_info *sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
 	ssize_t len = 0;
 
-	spin_lock(&sbi->lock);
+	read_lock(&sbi->lock);
 	struct ephmfs_dev_info *dev_info;
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
 		len += scnprintf(buf + len, PAGE_SIZE - len, "%s\n", dev_info->dev_name);
 	}
-	spin_unlock(&sbi->lock);
+	read_unlock(&sbi->lock);
 
 	return len;
 }
@@ -1014,7 +1014,7 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 
 	sbi = container_of(kobj, struct ephmfs_sb_info, sysfs_kobj);
 
-	spin_lock(&sbi->lock);
+	write_lock(&sbi->lock);
 	// Make sure the device hasn't already been added
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
 		if (strcmp(dev_info->dev_name, dev_name) == 0) {
@@ -1045,7 +1045,7 @@ static ssize_t ephmfs_devs_store(struct kobject *kobj, struct kobj_attribute *at
 
 	list_add(&dev_info->node, &sbi->dax_devs);
 
-	spin_unlock(&sbi->lock);
+	write_unlock(&sbi->lock);
 
 	return count;
 
@@ -1054,7 +1054,7 @@ put_dax_dev:
 free_dev_info:
 	kfree(dev_info);
 unlock:
-	spin_unlock(&sbi->lock);
+	write_unlock(&sbi->lock);
 	kfree(dev_name);
 	return err;
 }
