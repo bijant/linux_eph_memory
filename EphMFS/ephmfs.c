@@ -17,6 +17,7 @@
 #include <linux/statfs.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
+#include <asm/asm.h>
 
 #include "ephmfs.h"
 
@@ -34,11 +35,41 @@ static struct ephmfs_inode_info *EMFS_INODE(struct inode *inode)
 	return inode->i_private;
 }
 
-static void ephmfs_revoke_page(struct ephmfs_page *page)
+/*
+ * Zero size bytes of memory starting at addr (should be page-aligned, but I
+ * guess doesn't have to).
+ * Returns non-zero if the memory was not successfully zeroed.
+ */
+static inline u64 ephmfs_clear_page(void *addr, u64 size)
+{
+	/*
+	 * Since we are clearing ephemeral memory that can be revoked at any
+	 * time, we can't just use memset. Instead, we use rep stosb, and
+	 * add that instruction to the exception table, so if an MCE occurs,
+	 * we will recover, and size will be non-zero.
+	 * See https://gcc.gnu.org/onlinedocs/gcc/Machine-Constraints.html for
+	 * information on the ASM constraints.
+	 * High level: "c" is register C, "D" is the di register, and "a" is
+	 * register A.
+	 */
+	asm volatile(
+		"1: rep stosb\n"
+		"2:\n"
+		_ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_DEFAULT_MCE_SAFE)
+		: "+c" (size), "+D" (addr)
+		: "a" (0)
+		: "memory"
+	);
+
+	return size;
+}
+
+static void ephmfs_revoke_page(struct ephmfs_page *page, bool dev_info_held)
 {
 	struct ephmfs_dev_info *dev_info = page->dev_info;
 
-	spin_lock(&dev_info->lock);
+	if (!dev_info_held)
+		spin_lock(&dev_info->lock);
 	spin_lock(&page->lock);
 
 	if (page->revoked)
@@ -54,16 +85,19 @@ static void ephmfs_revoke_page(struct ephmfs_page *page)
 
 unlock:
 	spin_unlock(&page->lock);
-	spin_unlock(&dev_info->lock);
+	if (!dev_info_held)
+		spin_unlock(&dev_info->lock);
 }
 
 static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 {
-	struct ephmfs_page *page = NULL;
+	struct ephmfs_page *page, *ret = NULL;
 	struct ephmfs_dev_info *dev_info;
 	void *kaddr;
+	u64 shift;
 
 	spin_lock(&sbi->lock);
+	shift = ilog2(sbi->page_size);
 
 	/* Find a device with free pages */
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
@@ -74,26 +108,40 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 			continue;
 		}
 
-		page = list_first_entry(&dev_info->free_list, struct ephmfs_page, node);
-		list_del(&page->node);
-		list_add_tail(&page->node, &dev_info->active_list);
-		page->on_free_list = false;
-		dev_info->free_pages--;
+		page = list_first_entry(&dev_info->free_list,
+			struct ephmfs_page, node);
+		while (!list_entry_is_head(page, &dev_info->free_list, node)) {
+			list_del(&page->node);
+			list_add_tail(&page->node, &dev_info->active_list);
+			page->on_free_list = false;
+			dev_info->free_pages--;
+
+			/*
+			 * Attempt to clear the page. Release the dev_info lock
+			 * since clearing is expensive.
+			 */
+			spin_unlock(&dev_info->lock);
+			kaddr = dev_info->kaddr + (page->page_num << shift);
+			if (!ephmfs_clear_page(kaddr, sbi->page_size)) {
+				/* dev_info lock is already unlocked*/
+				ret = page;
+				goto out;
+			}
+
+			/* The page is bad, revoke it and try the next one */
+			spin_lock(&dev_info->lock);
+			ephmfs_revoke_page(page, true);
+
+			page = list_first_entry(&dev_info->free_list,
+				struct ephmfs_page, node);
+		}
 
 		spin_unlock(&dev_info->lock);
-
-		break;
 	}
 
-	/* Make sure to zero the page */
-	if (page) {
-		kaddr = dev_info->kaddr + (page->page_num << ilog2(sbi->page_size));
-		memset(kaddr, 0, sbi->page_size);
-	}
-
+out:
 	spin_unlock(&sbi->lock);
-
-	return page;
+	return ret;
 }
 
 static void ephmfs_free_page(struct ephmfs_page *page)
@@ -848,7 +896,7 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 		index = page->page_offset << (page_shift - PAGE_SHIFT);
 		spin_unlock(&page->lock);
 
-		ephmfs_revoke_page(page);
+		ephmfs_revoke_page(page, false);
 
 		if (!inode)
 			continue;
