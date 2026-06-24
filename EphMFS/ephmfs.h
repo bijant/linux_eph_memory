@@ -21,6 +21,7 @@ struct ephmfs_dev_info {
 	struct list_head active_list;
 	u64 num_pages;
 	u64 free_pages;
+	u64 revoked_pages;
 	spinlock_t lock;
 	struct list_head node;
 };
@@ -35,12 +36,18 @@ struct ephmfs_page {
 	u64 num_base_pages;
 	struct inode *inode; /* The inode this page belongs to */
 	struct ephmfs_dev_info *dev_info; /* The device this page belongs to */
+	bool revoked;
 	spinlock_t lock; /* Protects the fields above it in this struct. */
 	/*
 	 * Linked list node to connect pages to the free/active list.
 	 * Protected by ephmfs_dev_info.lock
 	 */
 	struct list_head node;
+	/*
+	 * Whether or not this page is on the free list.
+	 * Protected by ephmfs_dev_info.lock
+	 */
+	bool on_free_list;
 };
 
 struct ephmfs_sb_info {

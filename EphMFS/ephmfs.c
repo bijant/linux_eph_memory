@@ -34,6 +34,29 @@ static struct ephmfs_inode_info *EMFS_INODE(struct inode *inode)
 	return inode->i_private;
 }
 
+static void ephmfs_revoke_page(struct ephmfs_page *page)
+{
+	struct ephmfs_dev_info *dev_info = page->dev_info;
+
+	spin_lock(&dev_info->lock);
+	spin_lock(&page->lock);
+
+	if (page->revoked)
+		goto unlock;
+
+	list_del(&page->node);
+	page->revoked = true;
+	dev_info->revoked_pages++;
+	if (page->on_free_list) {
+		dev_info->free_pages--;
+		page->on_free_list = false;
+	}
+
+unlock:
+	spin_unlock(&page->lock);
+	spin_unlock(&dev_info->lock);
+}
+
 static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 {
 	struct ephmfs_page *page = NULL;
@@ -54,6 +77,7 @@ static struct ephmfs_page *ephmfs_alloc_page(struct ephmfs_sb_info *sbi)
 		page = list_first_entry(&dev_info->free_list, struct ephmfs_page, node);
 		list_del(&page->node);
 		list_add_tail(&page->node, &dev_info->active_list);
+		page->on_free_list = false;
 		dev_info->free_pages--;
 
 		spin_unlock(&dev_info->lock);
@@ -77,16 +101,20 @@ static void ephmfs_free_page(struct ephmfs_page *page)
 	struct ephmfs_dev_info *dev_info = page->dev_info;
 
 	spin_lock(&dev_info->lock);
+	spin_lock(&page->lock);
+
+	page->page_offset = 0;
+	page->inode = NULL;
+	if (page->revoked)
+		goto unlock;
 
 	list_del(&page->node);
 	list_add(&page->node, &dev_info->free_list);
 	dev_info->free_pages++;
+	page->on_free_list = true;
 
-	spin_lock(&page->lock);
-	page->page_offset = 0;
-	page->inode = NULL;
+unlock:
 	spin_unlock(&page->lock);
-
 	spin_unlock(&dev_info->lock);
 }
 
@@ -530,17 +558,21 @@ static int ephmfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct ephmfs_dev_info *dev_info;
 	u64 num_pages = 0;
 	u64 free_pages = 0;
+	u64 revoked_pages = 0;
 
 	spin_lock(&sbi->lock);
 
 	list_for_each_entry(dev_info, &sbi->dax_devs, node) {
+		spin_lock(&dev_info->lock);
 		num_pages += dev_info->num_pages;
 		free_pages += dev_info->free_pages;
+		revoked_pages += dev_info->revoked_pages;
+		spin_unlock(&dev_info->lock);
 	}
 
 	buf->f_type = sb->s_magic;
 	buf->f_bsize = PAGE_SIZE;
-	buf->f_blocks = num_pages;
+	buf->f_blocks = num_pages - revoked_pages;
 	buf->f_bfree = free_pages;
 	buf->f_bavail = free_pages;
 	buf->f_files = LONG_MAX;
@@ -723,6 +755,7 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 	// than just base pages.
 	dev_info->num_pages = num_base_pages;
 	dev_info->free_pages = num_base_pages;
+	dev_info->revoked_pages = 0;
 
 	INIT_LIST_HEAD(&dev_info->free_list);
 	INIT_LIST_HEAD(&dev_info->active_list);
@@ -739,6 +772,8 @@ static int ephmfs_populate_dev_info(struct ephmfs_dev_info *dev_info,
 		page->page_num = i;
 		page->inode = NULL;
 		page->dev_info = dev_info;
+		page->revoked = false;
+		page->on_free_list = true;
 		spin_lock_init(&page->lock);
 		list_add(&page->node, &dev_info->free_list);
 	}
@@ -812,6 +847,8 @@ static int ephmfs_notify_failure(struct dax_device *dax_dev, u64 off, u64 len, i
 		inode = page->inode ? igrab(page->inode) : NULL;
 		index = page->page_offset << (page_shift - PAGE_SHIFT);
 		spin_unlock(&page->lock);
+
+		ephmfs_revoke_page(page);
 
 		if (!inode)
 			continue;
