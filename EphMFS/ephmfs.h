@@ -9,6 +9,12 @@
 struct ephmfs_page;
 struct ephmfs_sb_info;
 
+/*
+ * Ephemeral memory is allocated to a host/VM in chunks of EPHMFS_CHUNK_SIZE
+ * and are similarly aligned.
+ */
+#define EPHMFS_CHUNK_SIZE (256UL * 1024 * 1024)
+
 /* Stores the information for a dax device used by EphMFS */
 struct ephmfs_dev_info {
 	struct dax_device *dax_dev;

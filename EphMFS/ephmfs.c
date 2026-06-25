@@ -64,19 +64,21 @@ static inline u64 ephmfs_clear_page(void *addr, u64 size)
 	return size;
 }
 
-static void ephmfs_revoke_page(struct ephmfs_page *page, bool dev_info_held)
+/* Call holding ephmfs_dev_info.lock */
+static void ephmfs_revoke_single_page(struct ephmfs_page *page)
 {
 	struct ephmfs_dev_info *dev_info = page->dev_info;
-
-	if (!dev_info_held)
-		spin_lock(&dev_info->lock);
 	spin_lock(&page->lock);
 
-	if (page->revoked)
+	/*
+	 * Should be handled by the check in ephmfs_revoke_page, but check
+	 * again just in case.
+	 */
+	if (unlikely(page->revoked))
 		goto unlock;
 
 	list_del(&page->node);
-	page->revoked = true;
+	WRITE_ONCE(page->revoked, true);
 	dev_info->revoked_pages++;
 	if (page->on_free_list) {
 		dev_info->free_pages--;
@@ -85,6 +87,44 @@ static void ephmfs_revoke_page(struct ephmfs_page *page, bool dev_info_held)
 
 unlock:
 	spin_unlock(&page->lock);
+}
+
+static void ephmfs_revoke_page(struct ephmfs_page *page, bool dev_info_held)
+{
+	struct ephmfs_dev_info *dev_info = page->dev_info;
+	struct ephmfs_page *p;
+	u64 chunk_page_size;
+	u64 start;
+	u64 end;
+
+	/*
+	 * If this page is already revoked, it's chunk should be revoked too,
+	 * so we can just return.
+	 */
+	if (READ_ONCE(page->revoked))
+		return;
+
+	/*
+	 * ephmfs_dev_info.sbi and ephmfs_page.page_num are constant, so no
+	 * lock required.
+	 */
+	chunk_page_size = EPHMFS_CHUNK_SIZE / dev_info->sbi->page_size;
+	start = page->page_num & ~(chunk_page_size - 1);
+	end = min(start + chunk_page_size, dev_info->num_pages);
+
+	if (!dev_info_held)
+		spin_lock(&dev_info->lock);
+
+	/*
+	 * When one page is revoked, all pages in the same contiguous
+	 * EPHMFS_CHUNK_SIZE chunk are also revoked.
+	 */
+	for (u64 page_num = start; page_num < end; page_num++) {
+		p = &dev_info->pages[page_num];
+
+		ephmfs_revoke_single_page(p);
+	}
+
 	if (!dev_info_held)
 		spin_unlock(&dev_info->lock);
 }
@@ -691,6 +731,13 @@ static int ephmfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		return -ENOMEM;
 
 	sbi->page_size = PAGE_SIZE;
+	/*
+	 * Proactive warning for when we allow different page sizes, since a
+	 * the chunk size being less than the page size could be problematic
+	 * as ephemeral memory could be added/revoked at a granularity smaller
+	 * than the page size.
+	 */
+	WARN_ON(sbi->page_size > EPHMFS_CHUNK_SIZE);
 	INIT_LIST_HEAD(&sbi->dax_devs);
 	rwlock_init(&sbi->lock);
 	kobject_init(&sbi->sysfs_kobj, &ephmfs_kobj_type);
