@@ -208,32 +208,59 @@ unlock:
 }
 
 /*
- * Allocate a page and insert it into the inode's maple tree at the given offset.
- * Returns the allocated page, or NULL on failure.
- * The inode_info->lock should be held by the caller, and will still be held
- * when this function returns.
+ * Allocate a page and insert it into the inode's maple tree at the given
+ * offset, if a page does not already exist at that offset.
+ * Returns either the existing page, the newly allocated page, or an
+ * ERR_PTR(-errno) on failure.
+ * If new is non NULL, *new will be set to true if a new page was allocated.
+ * Takes ephmfs_inode_info.lock internally.
  */
 static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *sbi,
-	struct ephmfs_inode_info *inode_info, u64 page_offset)
+	struct ephmfs_inode_info *inode_info, u64 page_offset, bool *new)
 {
+	struct ephmfs_page *new_page;
 	struct ephmfs_page *page;
 	int ret;
 
-	page = ephmfs_alloc_page(sbi);
-	if (!page)
-		return NULL;
+	if (new)
+		*new = false;
+	/*
+	 * Before we do an expensive allocate and zero operation, make sure
+	 * another thread hasn't already done so
+	 */
+	spin_lock(&inode_info->lock);
+	page = mtree_load(&inode_info->mt, page_offset);
+	spin_unlock(&inode_info->lock);
+	if (page)
+		return page;
+
+	new_page = ephmfs_alloc_page(sbi);
+	if (!new_page)
+		return ERR_PTR(-ENOSPC);
 
 	/* Record the file offset and inode before publishing the page into the tree. */
-	page->page_offset = page_offset;
-	page->inode = inode_info->inode;
+	new_page->page_offset = page_offset;
+	new_page->inode = inode_info->inode;
 
-	ret = mtree_insert(&inode_info->mt, page_offset, page, GFP_KERNEL);
-	if (ret) {
-		ephmfs_free_page(page);
-		return NULL;
+	/* Make sure a racing thread hasn't beat us to the punch */
+	spin_lock(&inode_info->lock);
+	page = mtree_load(&inode_info->mt, page_offset);
+	if (page) {
+		spin_unlock(&inode_info->lock);
+		ephmfs_free_page(new_page);
+		return page;
 	}
 
-	return page;
+	ret = mtree_insert(&inode_info->mt, page_offset, new_page, GFP_ATOMIC);
+	spin_unlock(&inode_info->lock);
+	if (ret) {
+		ephmfs_free_page(new_page);
+		return ERR_PTR(ret);
+	}
+
+	if (new)
+		*new = true;
+	return new_page;
 }
 
 static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
@@ -242,9 +269,9 @@ static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	struct ephmfs_sb_info *sbi = EMFS_SB(inode->i_sb);
 	struct ephmfs_inode_info *inode_info = EMFS_INODE(inode);
 	struct ephmfs_page *page;
+	bool new_page;
 	u64 page_offset;
 	u64 page_shift;
-	int ret = 0;
 
 	page_shift = ilog2(sbi->page_size);
 	page_offset = offset >> page_shift;
@@ -253,30 +280,17 @@ static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	iomap->offset = offset;
 	iomap->length = length;
 
-	spin_lock(&inode_info->lock);
-	page = mtree_load(&inode_info->mt, page_offset);
+	page = ephmfs_alloc_and_insert_page(sbi, inode_info, page_offset, &new_page);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
 
-	if (!page) {
-		page = ephmfs_alloc_and_insert_page(sbi, inode_info, page_offset);
-		if (!page) {
-			ret = -ENOSPC;
-			goto out_unlock;
-		}
-
+	if (new_page)
 		iomap->flags |= IOMAP_F_NEW;
-		iomap->type = IOMAP_MAPPED;
-		iomap->addr = page->page_num << page_shift;
-		iomap->dax_dev = page->dev_info->dax_dev;
-	} else {
-		/* There is already a page allocated. Just use that */
-		iomap->type = IOMAP_MAPPED;
-		iomap->addr = page->page_num << page_shift;
-		iomap->dax_dev = page->dev_info->dax_dev;
-	}
+	iomap->type = IOMAP_MAPPED;
+	iomap->addr = page->page_num << page_shift;
+	iomap->dax_dev = page->dev_info->dax_dev;
 
-out_unlock:
-	spin_unlock(&inode_info->lock);
-	return ret;
+	return 0;
 }
 
 const struct iomap_ops ephmfs_iomap_ops = {
@@ -450,16 +464,9 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 	for (off = offset; off < offset + len; off += sbi->page_size) {
 		u64 page_offset = off >> page_shift;
 
-		spin_lock(&info->lock);
-		page = mtree_load(&info->mt, page_offset);
-		if (!page) {
-			page = ephmfs_alloc_and_insert_page(sbi, info, page_offset);
-			if (!page) {
-				spin_unlock(&info->lock);
-				return -ENOSPC;
-			}
-		}
-		spin_unlock(&info->lock);
+		page = ephmfs_alloc_and_insert_page(sbi, info, page_offset, NULL);
+		if (IS_ERR(page))
+			return PTR_ERR(page);
 	}
 
 	return 0;
