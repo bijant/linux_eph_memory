@@ -13,6 +13,7 @@
 #include <linux/namei.h>
 #include <linux/pagemap.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/spinlock.h>
 #include <linux/statfs.h>
 #include <linux/types.h>
@@ -312,7 +313,7 @@ static void ephmfs_close(struct vm_area_struct *vma)
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
 
 	spin_lock(&info->lock);
-	if (info->owner == current) {
+	if (info->owner && same_thread_group(info->owner, current)) {
 		put_task_struct(info->owner);
 		info->owner = NULL;
 		info->base_addr = 0;
@@ -326,7 +327,7 @@ static int ephmfs_mremap(struct vm_area_struct *vma)
 	struct ephmfs_inode_info *info = EMFS_INODE(inode);
 
 	spin_lock(&info->lock);
-	if (info->owner != current) {
+	if (!info->owner || !same_thread_group(info->owner, current)) {
 		spin_unlock(&info->lock);
 		return -EPERM;
 	}
@@ -906,7 +907,7 @@ static int ephmfs_kill_procs(struct inode *inode, loff_t index, loff_t count, sh
 	if (!owner)
 		goto unlock;
 
-	if ((mf_flags & MF_ACTION_REQUIRED) && (owner == current))
+	if ((mf_flags & MF_ACTION_REQUIRED) && same_thread_group(owner, current))
 		ret = force_sig_mceerr(BUS_MCEERR_AR, (void __user *)addr, lsb);
 	else
 		ret = send_sig_mceerr(BUS_MCEERR_AO, (void __user *)addr, lsb, owner);
