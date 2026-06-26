@@ -21,6 +21,7 @@
 #include <asm/asm.h>
 
 #include "ephmfs.h"
+#include "ephmfs_uapi.h"
 
 static const struct super_operations ephmfs_ops;
 static const struct inode_operations ephmfs_dir_inode_ops;
@@ -263,6 +264,41 @@ static struct ephmfs_page *ephmfs_alloc_and_insert_page(struct ephmfs_sb_info *s
 	return new_page;
 }
 
+/*
+ * Callback invoked by dax_break_layout() while it waits for a mapped DAX page
+ * to become idle. Drop the invalidate lock so the process holding the mapping
+ * can unmap/unpin the page, then reacquire it before retrying.
+ */
+static void ephmfs_wait_dax_page(struct inode *inode)
+{
+	filemap_invalidate_unlock(inode->i_mapping);
+	schedule();
+	filemap_invalidate_lock(inode->i_mapping);
+}
+
+/*
+ * Unmap [start, end) from all processes and remove the corresponding DAX
+ * entries from the mapping, waiting for any outstanding page references to
+ * drain. After this returns successfully the backing pages in the range are no
+ * longer mapped and may be freed. Must be called with the inode's invalidate
+ * lock held exclusively.
+ */
+static int ephmfs_break_layout(struct inode *inode, loff_t start, loff_t end)
+{
+	return dax_break_layout(inode, start, end, ephmfs_wait_dax_page);
+}
+
+static int ephmfs_unmap_pages(struct inode *inode)
+{
+	/* unmap the whole file */
+	return ephmfs_break_layout(inode, 0, LLONG_MAX);
+}
+
+static void ephmfs_remap_pages(struct inode *inode)
+{
+	/* Leave empty for now. Page table will repopulate via page faults. */
+}
+
 static int ephmfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
 {
@@ -297,30 +333,6 @@ const struct iomap_ops ephmfs_iomap_ops = {
 	.iomap_begin = ephmfs_iomap_begin,
 };
 
-/*
- * Callback invoked by dax_break_layout() while it waits for a mapped DAX page
- * to become idle. Drop the invalidate lock so the process holding the mapping
- * can unmap/unpin the page, then reacquire it before retrying.
- */
-static void ephmfs_wait_dax_page(struct inode *inode)
-{
-	filemap_invalidate_unlock(inode->i_mapping);
-	schedule();
-	filemap_invalidate_lock(inode->i_mapping);
-}
-
-/*
- * Unmap [start, end) from all processes and remove the corresponding DAX
- * entries from the mapping, waiting for any outstanding page references to
- * drain. After this returns successfully the backing pages in the range are no
- * longer mapped and may be freed. Must be called with the inode's invalidate
- * lock held exclusively.
- */
-static int ephmfs_break_layout(struct inode *inode, loff_t start, loff_t end)
-{
-	return dax_break_layout(inode, start, end, ephmfs_wait_dax_page);
-}
-
 static void ephmfs_close(struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(vma->vm_file);
@@ -331,6 +343,7 @@ static void ephmfs_close(struct vm_area_struct *vma)
 		put_task_struct(info->owner);
 		info->owner = NULL;
 		info->base_addr = 0;
+		info->attempt_count = 0;
 	}
 	spin_unlock(&info->lock);
 }
@@ -354,6 +367,8 @@ static int ephmfs_mremap(struct vm_area_struct *vma)
 static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	bool in_attempt;
 	vm_fault_t result = 0;
 	unsigned long pfn;
 
@@ -363,7 +378,14 @@ static vm_fault_t ephmfs_huge_fault(struct vm_fault *vmf, unsigned int order)
 	 * under us while we are establishing a mapping for it.
 	 */
 	filemap_invalidate_lock_shared(inode->i_mapping);
-	result = dax_iomap_fault(vmf, order, &pfn, NULL, &ephmfs_iomap_ops);
+	spin_lock(&info->lock);
+	in_attempt = info->attempt_count > 0;
+	spin_unlock(&info->lock);
+	/* If we're not in the attempt context, we shouldn't be faulting in this page */
+	if (in_attempt)
+		result = dax_iomap_fault(vmf, order, &pfn, NULL, &ephmfs_iomap_ops);
+	else
+		result = VM_FAULT_SIGSEGV;
 	filemap_invalidate_unlock_shared(inode->i_mapping);
 
 	return result;
@@ -382,6 +404,63 @@ static struct vm_operations_struct ephmfs_vm_ops = {
 	.page_mkwrite = ephmfs_fault,
 	.pfn_mkwrite = ephmfs_fault,
 };
+
+static long ephmfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct inode *inode = file_inode(file);
+	struct ephmfs_inode_info *info = EMFS_INODE(inode);
+	long ret = 0;
+
+	if (cmd != EPHMFS_IOCTL_ATTEMPT_ON && cmd != EPHMFS_IOCTL_ATTEMPT_OFF)
+		return -ENOTTY;
+
+	filemap_invalidate_lock(inode->i_mapping);
+	spin_lock(&info->lock);
+
+	if (!info->owner || !same_thread_group(info->owner, current)) {
+		ret = -EPERM;
+		goto out_unlock;
+	}
+
+	switch (cmd) {
+	case EPHMFS_IOCTL_ATTEMPT_ON:
+		if (info->attempt_count == 0) {
+			/*
+			 * Don't need to release inode_info.lock since
+			 * ephmfs_remap_pages() is currently a no-op.
+			 */
+			ephmfs_remap_pages(inode);
+		}
+		info->attempt_count++;
+		break;
+	case EPHMFS_IOCTL_ATTEMPT_OFF:
+		if (info->attempt_count == 0) {
+			ret = -EINVAL;
+			goto out_unlock;
+		} else if (info->attempt_count == 1) {
+			spin_unlock(&info->lock);
+			ret = ephmfs_unmap_pages(inode);
+			spin_lock(&info->lock);
+			if (ret)
+				goto out_unlock;
+			/*
+			 * Check if we raced with ephmfs_close() while we let
+			 * go of inode_info->lock and it zeroed the attempt
+			 * count.
+			 * No need to return error in this case.
+			 */
+			if (info->attempt_count == 0)
+				goto out_unlock;
+		}
+		info->attempt_count--;
+		break;
+	}
+
+out_unlock:
+	spin_unlock(&info->lock);
+	filemap_invalidate_unlock(inode->i_mapping);
+	return ret;
+}
 
 static int ephmfs_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -473,6 +552,8 @@ static long ephmfs_fallocate(struct file *file, int mode, loff_t offset, loff_t 
 }
 
 const struct file_operations ephmfs_file_operations = {
+	.unlocked_ioctl = ephmfs_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 	.mmap = ephmfs_mmap,
 	.fop_flags = FOP_MMAP_SYNC,
 	.fsync = noop_fsync,
@@ -569,6 +650,8 @@ static struct inode *ephmfs_get_inode(struct super_block *sb, const struct inode
 	}
 	info->inode = inode;
 	info->owner = NULL;
+	info->base_addr = 0;
+	info->attempt_count = 0;
 	spin_lock_init(&info->lock);
 	mt_init(&info->mt);
 

@@ -68,7 +68,12 @@ struct ephmfs_inode_info {
 	/* Assume that only one task can map the same EphMFS file */
 	struct task_struct *owner;
 	u64 base_addr;
-	/* TODO: This would probably be better as a read/write lock */
+	/*
+	 * Applications can only access a file when it is marked as in the
+	 * "attempt" context. This helps ensure that applications understand
+	 * the risks of using ephemeral memory before they can use it.
+	 */
+	unsigned int attempt_count;
 	spinlock_t lock;
 	struct inode *inode;
 	struct maple_tree mt;
